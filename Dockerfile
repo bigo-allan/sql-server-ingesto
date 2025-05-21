@@ -20,10 +20,6 @@ RUN apt-get update -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Configurar el symbolic link para el driver ODBC si es necesario (a veces msodbcsql17 lo hace automáticamente)
-# Puedes verificar si es necesario en los logs si pyodbc no encuentra el driver.
-# RUN ln -s /opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.X.so.1.1 /usr/lib/libmsodbcsql-17.so
-
 # Copia requirements.txt e instala las librerías de Python.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
