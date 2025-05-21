@@ -5,7 +5,7 @@ import pandas as pd
 from google.cloud import secretmanager
 from google.cloud import storage
 import sqlalchemy
-import pymssql 
+import pyodbc
 
 # --- Configuración de tu función ---
 SECRET_ID = "db-credentials" # Nombre del secreto en Secret Manager (Parte 1.3)
@@ -47,23 +47,21 @@ def ingest_data(request):
         database = db_config.get('database')
 
         if not all([host, user, password, database]):
-            raise ValueError("Credenciales de base de datos incompletas (host, user, password, database).")
+            raise ValueError("Credenciales incompletas.")
 
         print(f"Intentando conectar a SQL Server: {host}:{port}/{database} con usuario {user}...")
 
         DATABASE_URL = (
-            f"mssql+pymssql://{user}:{password}@"
-            f"{host}:{port}/{database}"
+            f"mssql+pyodbc://{user}:{password}@{host}:{port}/{database}?"
+            f"driver={{ODBC Driver 17 for SQL Server}}"
         )
+
         engine = sqlalchemy.create_engine(DATABASE_URL)
         conn = engine.connect()
-        print("Conexión a SQL Server establecida exitosamente.")
+        print("Conexión a SQL Server establecida exitosamente con pyodbc.")
 
-    except ValueError as ve:
-        print(f"ERROR DE CONFIGURACIÓN: {ve}")
-        return f"Error de configuración de la base de datos: {ve}", 400
-    except Exception as e:
-        print(f"ERROR DE CONEXIÓN: Fallo al conectar a la base de datos SQL Server: {e}")
+    except Exception as e: # Captura cualquier excepción de conexión
+        print(f"ERROR DE CONEXIÓN con pyodbc: Fallo al conectar a la base de datos SQL Server: {e}")
         return f"Error al conectar a la base de datos SQL Server: {e}", 500
 
     # --- Tu Consulta SQL Específica ---
