@@ -1,96 +1,83 @@
 import os
-import json
 from datetime import datetime, timezone
+import json
 import pandas as pd
-from google.cloud import secretmanager
-from google.cloud import storage
-import pyodbc # Usaremos pyodbc directamente, sin SQLAlchemy para la conexión
-import gunicorn # Importado para asegurar que gunicorn esté disponible si el entorno lo usa.
+from google.cloud import secretmanager, storage
+import pyodbc
 
-# --- Configuración de tu función ---
-SECRET_ID = "db-credentials" # Nombre del secreto en Secret Manager (Parte 1.3)
-PROJECT_ID = os.environ.get("GCP_PROJECT") or os.environ.get("GCP_PROJECT_ID")
-BUCKET_NAME = "mi-datalake" # Nombre de tu bucket de GCS (Parte 1.2)
-GCS_PREFIX = "temp/stock_actual" # Prefijo de carpeta en GCS (Parte 1.2)
+# --- Configuración ---
+SECRET_ID = "db-credentials"
+BUCKET_NAME = "mi-datalake"
+GCS_PREFIX = "temp/stock_actual"
 
-def get_secret(secret_id, project_id):
-    """Accede a un secreto almacenado en Secret Manager."""
+# --- Funciones Auxiliares ---
+def _get_secret(secret_id, project_id):
     client = secretmanager.SecretManagerServiceClient()
     name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
     response = client.access_secret_version(request={"name": name})
     return json.loads(response.payload.data.decode("UTF-8"))
 
-def ingest_data(request):
-    """
-    Función principal HTTP de Cloud Run.
-    Se conecta a SQL Server, ejecuta una consulta, convierte a Parquet
-    y lo sube a Google Cloud Storage.
-    """
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Iniciando proceso de ingesta para el proyecto: {PROJECT_ID}")
+def _connect_to_db(db_config):
+    host = db_config.get('host')
+    port = db_config.get('port', '1433')
+    user = db_config.get('user')
+    password = db_config.get('password')
+    database = db_config.get('database')
 
-    if not PROJECT_ID:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] ERROR: El ID del proyecto no está configurado en el entorno.")
-        return "Error interno del servidor: ID del proyecto no configurado.", 500
+    connection_string = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={host},{port};DATABASE={database};UID={user};PWD={password}"
+    )
+    return pyodbc.connect(connection_string, autocommit=True)
 
-    db_config = {}
-    try:
-        db_config = get_secret(SECRET_ID, PROJECT_ID)
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Credenciales de base de datos cargadas desde Secret Manager.")
-    except Exception as e:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] ERROR: Fallo al cargar las credenciales de la base de datos desde Secret Manager: {e}")
-        return f"Error al cargar credenciales de la base de datos: {e}", 500
-
-    conn = None # Inicializar la conexión a None
-    try:
-        host = db_config.get('host')
-        port = db_config.get('port', '1433') # Puerto como string para la cadena de conexión ODBC
-        user = db_config.get('user')
-        password = db_config.get('password')
-        database = db_config.get('database')
-
-        if not all([host, user, password, database]):
-            raise ValueError("Credenciales de base de datos incompletas (host, user, password, database).")
-
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Intentando conectar a SQL Server: {host}:{port}/{database} con usuario {user}...")
-        
-        # --- Conexión directa con pyodbc al SQL Server ---
-        # Asegúrate de que el nombre del DRIVER sea EXACTO al instalado en el Dockerfile.
-        # En este caso, es 'ODBC Driver 17 for SQL Server'
-        connection_string = (
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={host},{port};DATABASE={database};UID={user};PWD={password}"
-        )
-        
-        conn = pyodbc.connect(connection_string, autocommit=True) # autocommit es útil para queries de solo lectura
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Conexión a SQL Server establecida exitosamente con pyodbc.")
-
-    except pyodbc.Error as db_err:
-        sqlstate = db_err.args[0]
-        if sqlstate == '08001': # SQLSTATE para error de conexión a la BD
-            print(f"[{datetime.now(timezone.utc).isoformat()}] ERROR DE CONEXIÓN CRÍTICO: El servidor o puerto no es accesible, o las credenciales son incorrectas. Error: {db_err}")
-        else:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] ERROR DE CONEXIÓN SQL Server: {db_err}")
-        return f"Error al conectar a la base de datos SQL Server: {db_err}", 500
-    except ValueError as ve:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] ERROR DE CONFIGURACIÓN: {ve}")
-        return f"Error de configuración de la base de datos: {ve}", 400
-    except Exception as e:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] ERROR INESPERADO en la conexión: {e}")
-        return f"Error inesperado durante la conexión a la base de datos: {e}", 500
-
-    # --- Tu Consulta SQL Específica ---
+def _read_and_upload_data(conn, project_id):
     sql_query = """
     SELECT
         CodProd, 
         Stock
     FROM ACEROSB1.softland.Dw_VsnpStockalDia
     """ 
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Ejecutando consulta SQL: {sql_query}")
+    
+    df = pd.read_sql(sql_query, conn)
+    
+    if df.empty:
+        return "No data found."
 
+    current_time_utc = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") 
+    gcs_full_path = f"{GCS_PREFIX}/dt={current_time_utc}/data.parquet"
+
+    storage_client = storage.Client(project=project_id)
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(gcs_full_path)
+
+    from io import BytesIO
+    parquet_buffer = BytesIO()
+    df.to_parquet(parquet_buffer, index=False) 
+    parquet_buffer.seek(0)
+
+    blob.upload_from_file(parquet_buffer, content_type="application/octet-stream")
+    
+    return f"Successfully ingested {len(df)} rows to gs://{BUCKET_NAME}/{gcs_full_path}"
+
+# --- Función Principal (Entrypoint de Cloud Run) ---
+def ingest_data(request):
+    project_id = os.environ.get("GCP_PROJECT") or os.environ.get("GCP_PROJECT_ID")
+    if not project_id:
+        return "Error: Project ID not set.", 500
+
+    conn = None
     try:
-        # Pandas puede leer directamente de una conexión pyodbc
-        df = pd.read_sql(sql_query, conn)
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Datos leídos: {len(df)} filas.")
+        db_config = _get_secret(SECRET_ID, project_id)
+        conn = _connect_to_db(db_config)
+        
+        result_message = _read_and_upload_data(conn, project_id)
+        
+        return result_message, 200
 
-        if df.empty:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] La consulta no retornó datos.
+    except Exception as e:
+        # En producción, usar logging.error y no devolver detalles sensibles.
+        # Aquí, para depuración, devolvemos el error.
+        return f"Ingestion failed: {e}", 500
+    finally:
+        if conn:
+            conn.close()
