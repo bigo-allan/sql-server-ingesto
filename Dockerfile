@@ -1,7 +1,5 @@
-# Cambia 'python:3.10-slim-buster' a 'python:3.10-bookworm' o 'python:3.10'
-FROM python:3.10-bookworm 
+FROM python:3.10 
 
-# Resto del Dockerfile permanece igual:
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
