@@ -61,7 +61,7 @@ def _read_and_upload_data(conn, project_id):
 
 # --- Función Principal (Entrypoint de Cloud Run) ---
 def ingest_data(request):
-    project_id = os.environ.get("GCP_PROJECT") or os.environ.get("GCP_PROJECT_ID")
+    project_id = os.environ.get("GCP_PROJECT")
     if not project_id:
         return "Error: Project ID not set.", 500
 
